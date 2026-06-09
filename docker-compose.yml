@@ -1,0 +1,195 @@
+# Travel Mitra 2.0 — lean Airflow 3.x (LocalExecutor) + two Postgres instances.
+#
+#   postgres-data     : pgvector — the DATA DB (ETL writes, app reads)   [host :5432]
+#   postgres-airflow  : Airflow metadata only (internal)                 [no host port]
+#   airflow-apiserver : Airflow 3.x web UI / API                          [host :8080]
+#   airflow-scheduler : schedules + runs tasks in-process (LocalExecutor)
+#   airflow-init      : one-shot db migrate + admin user creation
+#
+# Usage:
+#   docker compose up airflow-init     # first time only
+#   docker compose up -d               # start the stack
+#   UI: http://localhost:8080
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  image: travel-mitra/airflow:3.0.0
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    # Airflow 3.x: user mgmt + web login live in the FAB auth manager (installed via requirements.txt).
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__EXPOSE_CONFIG: "true"
+    # Airflow 3.x: task runners (LocalExecutor in the scheduler container) call back to
+    # the Task Execution API on the api-server. Must point at the service, not localhost.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # Shared secret so the task runner's JWT is accepted by the api-server across containers.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-travelmitra-dev-jwt-secret-change-me}
+    # Data DB connection used by our ETL code (NOT Airflow's metadata DB).
+    # Plain libpq conninfo — we use psycopg3 directly (no SQLAlchemy).
+    DATABASE_URL: postgresql://app:app@postgres-data:5432/travelmitra
+    TRIPADVISOR_API_KEY: ${TRIPADVISOR_API_KEY:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    # LangSmith AI-usage tracing (opt-in: stays off until a key + tracing=true are set).
+    LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+    LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+    LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-travel-mitra}
+    LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+    # Make the `etl` package importable from DAGs (it's mounted at /opt/airflow/etl).
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/config:/opt/airflow/config
+    - ./etl:/opt/airflow/etl            # our ETL package, importable from DAGs
+    - ./data:/opt/airflow/seed:ro       # simplemaps CSV (default csv_path source)
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+
+services:
+  postgres-data:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: travelmitra
+    ports:
+      - "5433:5432"               # host:container — 5433 avoids clashing with a local Postgres on 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Baseline schema auto-applied on FIRST init of the pgdata volume.
+      # (Only runs when the volume is empty; later migrations go via psql.)
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app", "-d", "travelmitra"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-airflow:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" \
+          --firstname Admin --lastname User --role Admin \
+          --email admin@example.com || true
+    restart: on-failure
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      postgres-data:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      postgres-data:
+        condition: service_healthy
+
+  # Airflow 3.x parses DAGs in a SEPARATE process — without this, no DAGs appear.
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: always
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+
+  # Runs deferrable/async tasks; also clears the red "Triggerer" health item.
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    restart: always
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+
+  # FastAPI + LangGraph agent (SSE /chat, /health).
+  api:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    image: travel-mitra/api:latest
+    environment:
+      # Inside the network the data DB is reachable by service name on 5432.
+      DATABASE_URL: postgresql://app:app@postgres-data:5432/travelmitra
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AGENT_MODEL: ${AGENT_MODEL:-gemini-2.5-flash}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-travel-mitra}
+      LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres-data:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # Streamlit chat UI — talks to the api service over the compose network.
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    image: travel-mitra/ui:latest
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  airflow-db:

@@ -1,0 +1,25 @@
+# Agent / notebook environment (host venv) — separate from the Airflow image.
+# Install: python -m venv .venv && .venv\Scripts\activate && pip install -r requirements-agent.txt
+
+langgraph
+langgraph-checkpoint-postgres
+langchain-google-genai
+langchain-core
+psycopg[binary]
+pgvector
+httpx
+tenacity
+langsmith
+python-dotenv
+
+# notebook
+jupyter
+ipykernel
+
+# FastAPI app
+fastapi
+uvicorn[standard]
+sse-starlette
+
+# UI
+streamlit

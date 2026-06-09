@@ -1,0 +1,16 @@
+# FastAPI service image deps (lean — no notebook tooling).
+fastapi
+uvicorn[standard]
+sse-starlette
+
+langgraph
+langgraph-checkpoint-postgres
+langchain-google-genai
+langchain-core
+
+psycopg[binary]
+pgvector
+httpx
+tenacity
+langsmith
+python-dotenv

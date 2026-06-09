@@ -1,0 +1,19 @@
+# Extra deps layered on the Airflow image for our ETL tasks + web auth.
+#
+# IMPORTANT: do NOT pin packages that Airflow owns (SQLAlchemy, pandas, httpx,
+# pydantic, tenacity). The Airflow constraints file (see Dockerfile) pins those
+# to versions compatible with this Airflow release. We only add genuinely extra
+# packages here and let constraints resolve everything else.
+#
+# Gemini embeddings are called via the REST API using httpx (already bundled with
+# Airflow) — we intentionally avoid the google-genai SDK because it requires a
+# newer httpx than Airflow's constraints allow (httpx==0.27.0).
+
+# Web UI auth + `airflow users` command (Airflow 3.x moved this into the FAB provider).
+apache-airflow-providers-fab
+
+# ETL extras (not part of core Airflow).
+psycopg[binary]
+pgvector
+pandas                # tabular CSV ingest (cities) only; plain Python elsewhere
+langsmith             # AI usage tracing (embeddings now, agent later)

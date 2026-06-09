@@ -1,0 +1,10 @@
+.venv
+.git
+.env
+data
+notebooks
+airflow/logs
+docs
+**/__pycache__
+*.pyc
+.ipynb_checkpoints
